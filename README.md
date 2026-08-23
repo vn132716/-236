@@ -1,2 +1,9 @@
-# -236
-666
+{
+  "name": "cline-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
