@@ -1,157 +1,178 @@
-// Cloudflare 控制面板单文件 Worker。
+import http from 'http';
+import https from 'https';
+import { URL } from 'url';
+
 const DEFAULT_UPSTREAM_BASE_URL = 'https://ollama.com/v1';
+const PORT = process.env.PORT || 3000;
+
 const ROUTES = new Map([
-['/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
-['/models', { method: 'GET', upstreamPath: 'models' }],
+  ['/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
+  ['/models', { method: 'GET', upstreamPath: 'models' }],
 ]);
 
-function jsonResponse(body, status, corsHeaders) {
-const headers = new Headers(corsHeaders);
-headers.set('Content-Type', 'application/json; charset=utf-8');
-return new Response(JSON.stringify(body), { status, headers });
-}
-
-function getCorsHeaders(request, env) {
-const requestOrigin = request.headers.get('Origin') || '';
-const configuredOrigins = String(env.ALLOWED_ORIGINS || '*')
-.split(',')
-.map(origin => origin.trim())
-.filter(Boolean);
-
-const allowAnyOrigin = configuredOrigins.length === 0 || configuredOrigins.includes('*');
-
-if (!allowAnyOrigin && requestOrigin && !configuredOrigins.includes(requestOrigin)) {
-return null;
-}
-
-return new Headers({
-'Access-Control-Allow-Origin': allowAnyOrigin ? '*' : (requestOrigin || configuredOrigins[0]),
-'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
-'Access-Control-Expose-Headers': 'Content-Type, X-Request-Id, X-Ratelimit-Limit-Requests, X-Ratelimit-Remaining-Requests, X-Ratelimit-Limit-Tokens, X-Ratelimit-Remaining-Tokens',
-'Access-Control-Max-Age': '86400',
-'Vary': 'Origin',
-});
+function getCorsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
+    'Content-Type': 'application/json; charset=utf-8',
+  };
 }
 
 function normalizePath(pathname) {
-if (pathname === '/') return pathname;
-return pathname.replace(/\/+$/, '');
+  if (pathname === '/') return pathname;
+  return pathname.replace(/\/+$/, '');
 }
 
-function buildUpstreamHeaders(request) {
-const headers = new Headers();
-for (const name of ['Authorization', 'Content-Type', 'Accept']) {
-const value = request.headers.get(name);
-if (value) headers.set(name, value);
-}
-return headers;
+function proxyRequest(req, res) {
+  const corsHeaders = getCorsHeaders();
+  const pathname = normalizePath(new URL(req.url, `http://${req.headers.host}`).pathname);
+
+  console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
+
+  // 健康检查
+  if (pathname === '/health') {
+    res.writeHead(200, corsHeaders);
+    res.end(JSON.stringify({ ok: true, upstream: 'ollama-api-v1' }));
+    return;
+  }
+
+  // CORS 预检
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return;
+  }
+
+  // 检查路由
+  const route = ROUTES.get(pathname);
+  if (!route) {
+    console.log(`[ERROR] 路由未找到: ${pathname}`);
+    res.writeHead(404, corsHeaders);
+    res.end(JSON.stringify({ error: '未知路径' }));
+    return;
+  }
+
+  if (req.method !== route.method) {
+    console.log(`[ERROR] 方法不允许: ${req.method}, 期望: ${route.method}`);
+    res.writeHead(405, corsHeaders);
+    res.end(JSON.stringify({ error: '方法不允许' }));
+    return;
+  }
+
+  // 构建上游 URL
+  const upstreamPathFull = `${DEFAULT_UPSTREAM_BASE_URL}/${route.upstreamPath}`;
+  console.log(`[UPSTREAM] ${req.method} ${upstreamPathFull}`);
+
+  // 构建上游请求头
+  const upstreamHeaders = {};
+  
+  if (req.headers['content-type']) {
+    upstreamHeaders['Content-Type'] = req.headers['content-type'];
+  } else if (req.method !== 'GET') {
+    upstreamHeaders['Content-Type'] = 'application/json';
+  }
+
+  if (req.headers.authorization) {
+    upstreamHeaders['Authorization'] = req.headers.authorization;
+  }
+
+  // 解析 URL
+  let upstreamUrlObj;
+  try {
+    upstreamUrlObj = new URL(upstreamPathFull);
+  } catch (e) {
+    console.error(`[ERROR] URL 解析失败: ${upstreamPathFull}`, e.message);
+    res.writeHead(400, corsHeaders);
+    res.end(JSON.stringify({ error: 'URL 格式错误', details: e.message }));
+    return;
+  }
+
+  const protocol = upstreamUrlObj.protocol === 'https:' ? https : http;
+  const port = upstreamUrlObj.port || (upstreamUrlObj.protocol === 'https:' ? 443 : 80);
+
+  console.log(`[REQUEST] ${upstreamUrlObj.hostname}:${port}${upstreamUrlObj.pathname}`);
+
+  // 转发请求
+  const proxyReq = protocol.request(
+    {
+      hostname: upstreamUrlObj.hostname,
+      port: port,
+      path: upstreamUrlObj.pathname + upstreamUrlObj.search,
+      method: req.method,
+      headers: upstreamHeaders,
+      timeout: 600000, // 600 秒
+    },
+    (proxyRes) => {
+      console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
+      
+      let responseBody = '';
+
+      proxyRes.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+
+      proxyRes.on('end', () => {
+        let finalBody = responseBody;
+
+        // 尝试转换响应格式
+        try {
+          const jsonData = JSON.parse(responseBody);
+          
+          if (jsonData.data && jsonData.data.choices) {
+            console.log(`[FORMAT] 转换为 OpenAI 格式`);
+            finalBody = JSON.stringify(jsonData.data);
+          }
+        } catch (e) {
+          // 保持原样
+        }
+
+        const responseHeaders = {
+          ...corsHeaders,
+          'Content-Type': 'application/json; charset=utf-8',
+        };
+
+        res.writeHead(proxyRes.statusCode || 200, responseHeaders);
+        res.end(finalBody);
+      });
+    }
+  );
+
+  proxyReq.on('error', (error) => {
+    console.error(`[ERROR] 代理请求失败:`, error.code, error.message);
+    res.writeHead(502, corsHeaders);
+    res.end(JSON.stringify({
+      error: '上游请求失败',
+      message: error.message,
+    }));
+  });
+
+  proxyReq.on('timeout', () => {
+    console.error(`[ERROR] 代理请求超时`);
+    proxyReq.destroy();
+    res.writeHead(504, corsHeaders);
+    res.end(JSON.stringify({
+      error: '网关超时',
+      message: '上游服务器响应超时',
+    }));
+  });
+
+  // 转发请求体
+  if (req.method !== 'GET') {
+    req.on('data', (chunk) => {
+      proxyReq.write(chunk);
+    });
+    req.on('end', () => {
+      proxyReq.end();
+    });
+  } else {
+    proxyReq.end();
+  }
 }
 
-function buildUpstreamUrl(incomingUrl, route, env) {
-const configuredBaseUrl = String(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL)
-.trim()
-.replace(/\/+$/, '');
-const baseUrl = new URL(`${configuredBaseUrl}/`);
-if (!['http:', 'https:'].includes(baseUrl.protocol)) {
-throw new Error('UPSTREAM_BASE_URL 必须使用 http 或 https');
-}
-const upstreamUrl = new URL(route.upstreamPath, baseUrl);
-upstreamUrl.search = incomingUrl.search;
-return upstreamUrl;
-}
-
-function cleanJsonResponse(text) {
-// 移除 ```json 和 ``` 包装
-let cleaned = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-// 尝试找到第一个 { 和最后一个 }，提取 JSON
-const firstBrace = cleaned.indexOf('{');
-const lastBrace = cleaned.lastIndexOf('}');
-if (firstBrace !== -1 && lastBrace !== -1 && firstBrace < lastBrace) {
-cleaned = cleaned.substring(firstBrace, lastBrace + 1);
-}
-return cleaned;
-}
-
-export default {
-async fetch(request, env) {
-const corsHeaders = getCorsHeaders(request, env);
-if (!corsHeaders) {
-return jsonResponse({ error: '来源不允许' }, 403, new Headers());
-}
-
-const incomingUrl = new URL(request.url);
-const pathname = normalizePath(incomingUrl.pathname);
-
-if (pathname === '/health') {
-if (request.method !== 'GET') {
-return jsonResponse({ error: '方法不允许' }, 405, corsHeaders);
-}
-return jsonResponse({ ok: true, upstream: 'cline-bot-api-v1' }, 200, corsHeaders);
-}
-
-const route = ROUTES.get(pathname);
-if (!route) {
-return jsonResponse({ error: '未知路径' }, 404, corsHeaders);
-}
-
-if (request.method === 'OPTIONS') {
-return new Response(null, { status: 204, headers: corsHeaders });
-}
-
-if (request.method !== route.method) {
-const headers = new Headers(corsHeaders);
-headers.set('Allow', `${route.method}, OPTIONS`);
-return jsonResponse({ error: '方法不允许' }, 405, headers);
-}
-
-try {
-const upstreamUrl = buildUpstreamUrl(incomingUrl, route, env);
-const upstreamResponse = await fetch(upstreamUrl, {
-method: request.method,
-headers: buildUpstreamHeaders(request),
-body: request.method === 'GET' ? null : request.body,
-redirect: 'manual',
+// 启动服务器
+const server = http.createServer(proxyRequest);
+server.listen(PORT, () => {
+  console.log(`✅ 中转服务器运行在端口 ${PORT}`);
+  console.log(`📡 上游服务: ${DEFAULT_UPSTREAM_BASE_URL}`);
 });
-
-// 获取原始响应体
-const responseText = await upstreamResponse.text();
-let finalBody = responseText;
-
-// 尝试解析 JSON 并转换格式
-try {
-// 先清理可能的 Markdown 代码块
-const cleanedText = cleanJsonResponse(responseText);
-const jsonData = JSON.parse(cleanedText);
-// 如果 Cline 返回 { data: { choices: [...], ... }, success: true }
-// 改成 { choices: [...], ... } 格式（标准 OpenAI 格式）
-if (jsonData.data && jsonData.data.choices) {
-finalBody = JSON.stringify(jsonData.data);
-} else {
-finalBody = JSON.stringify(jsonData);
-}
-} catch (parseError) {
-// 如果还是解析失败，保持原样
-finalBody = responseText;
-}
-
-const responseHeaders = new Headers(upstreamResponse.headers);
-for (const [name, value] of corsHeaders) {
-responseHeaders.set(name, value);
-}
-responseHeaders.delete('Set-Cookie');
-responseHeaders.set('Content-Type', 'application/json; charset=utf-8');
-
-return new Response(finalBody, {
-status: upstreamResponse.status,
-statusText: upstreamResponse.statusText,
-headers: responseHeaders,
-});
-} catch (error) {
-return jsonResponse({
-error: '上游请求失败',
-message: error instanceof Error ? error.message : String(error),
-}, 502, corsHeaders);
-}
-},
-};
