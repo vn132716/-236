@@ -1,4 +1,3 @@
-1最好用版本中转：
 // Cloudflare 控制面板单文件 Worker。
 const DEFAULT_UPSTREAM_BASE_URL = 'https://ollama.com/v1';
 const ROUTES = new Map([
