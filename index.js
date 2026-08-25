@@ -2,53 +2,87 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
-// 固化你的上游平台地址
-const UPSTREAM_BASE_URL = 'https://ollama.com/v1';
+const DEFAULT_UPSTREAM_BASE_URL = 'https://ollama.com/v1';
 const PORT = process.env.PORT || 3000;
+
+const ROUTES = new Map([
+  ['/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
+  ['/models', { method: 'GET', upstreamPath: 'models' }],
+]);
 
 function getCorsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
-    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
+    'Content-Type': 'application/json; charset=utf-8',
   };
+}
+
+function normalizePath(pathname) {
+  if (pathname === '/') return pathname;
+  return pathname.replace(/\/+$/, '');
 }
 
 function proxyRequest(req, res) {
   const corsHeaders = getCorsHeaders();
-  
-  // 处理跨域预检请求
+  const pathname = normalizePath(new URL(req.url, `http://${req.headers.host}`).pathname);
+
+  console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
+
+  // 健康检查
+  if (pathname === '/health') {
+    res.writeHead(200, corsHeaders);
+    res.end(JSON.stringify({ ok: true, upstream: 'ollama-api-v1' }));
+    return;
+  }
+
+  // CORS 预检
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders);
     res.end();
     return;
   }
 
-  let requestUrlObj = new URL(req.url, `http://${req.headers.host}`);
-  let pathAndQuery = requestUrlObj.pathname + requestUrlObj.search;
+  // 检查路由
+  const route = ROUTES.get(pathname);
+  if (!route) {
+    console.log(`[ERROR] 路由未找到: ${pathname}`);
+    res.writeHead(404, corsHeaders);
+    res.end(JSON.stringify({ error: '未知路径' }));
+    return;
+  }
+
+  if (req.method !== route.method) {
+    console.log(`[ERROR] 方法不允许: ${req.method}, 期望: ${route.method}`);
+    res.writeHead(405, corsHeaders);
+    res.end(JSON.stringify({ error: '方法不允许' }));
+    return;
+  }
+
+  // 构建上游 URL
+  const upstreamPathFull = `${DEFAULT_UPSTREAM_BASE_URL}/${route.upstreamPath}`;
+  console.log(`[UPSTREAM] ${req.method} ${upstreamPathFull}`);
+
+  // 构建上游请求头
+  const upstreamHeaders = {};
   
-  if (pathAndQuery === '/' || pathAndQuery === '') {
-      res.writeHead(200, corsHeaders);
-      res.end("Railway 中转代理运行正常！（对接 ollama.com/v1 纯净透传模式）");
-      return;
+  if (req.headers['content-type']) {
+    upstreamHeaders['Content-Type'] = req.headers['content-type'];
+  } else if (req.method !== 'GET') {
+    upstreamHeaders['Content-Type'] = 'application/json';
   }
 
-  // 智能拼接上游地址：兼容根路径请求与完整的 /v1 路径
-  let upstreamPathFull = UPSTREAM_BASE_URL;
-  if (pathAndQuery.startsWith('/v1')) {
-    upstreamPathFull = 'https://ollama.com' + pathAndQuery;
-  } else {
-    // 如果请求不带 /v1，自动拼在 baseurl 后面
-    upstreamPathFull = UPSTREAM_BASE_URL + pathAndQuery.replace(/^\//, '');
+  if (req.headers.authorization) {
+    upstreamHeaders['Authorization'] = req.headers.authorization;
   }
 
-  const upstreamHeaders = { ...req.headers };
-  delete upstreamHeaders.host; 
-
+  // 解析 URL
   let upstreamUrlObj;
   try {
     upstreamUrlObj = new URL(upstreamPathFull);
   } catch (e) {
+    console.error(`[ERROR] URL 解析失败: ${upstreamPathFull}`, e.message);
     res.writeHead(400, corsHeaders);
     res.end(JSON.stringify({ error: 'URL 格式错误', details: e.message }));
     return;
@@ -57,9 +91,9 @@ function proxyRequest(req, res) {
   const protocol = upstreamUrlObj.protocol === 'https:' ? https : http;
   const port = upstreamUrlObj.port || (upstreamUrlObj.protocol === 'https:' ? 443 : 80);
 
-  // 防重复响应锁，避免 ERR_HTTP_HEADERS_SENT 崩溃
-  let isResSent = false;
+  console.log(`[REQUEST] ${upstreamUrlObj.hostname}:${port}${upstreamUrlObj.pathname}`);
 
+  // 转发请求
   const proxyReq = protocol.request(
     {
       hostname: upstreamUrlObj.hostname,
@@ -67,42 +101,78 @@ function proxyRequest(req, res) {
       path: upstreamUrlObj.pathname + upstreamUrlObj.search,
       method: req.method,
       headers: upstreamHeaders,
-      timeout: 600000, // 保持 600 秒长连接
+      timeout: 600000, // 600 秒
     },
     (proxyRes) => {
-      if (isResSent) return;
-      isResSent = true;
-
-      // 无损透传响应头和二进制/文本流，绝对不随意篡改返回体
-      const responseHeaders = { ...proxyRes.headers, ...corsHeaders };
-      res.writeHead(proxyRes.statusCode || 200, responseHeaders);
+      console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
       
-      proxyRes.pipe(res);
+      let responseBody = '';
+
+      proxyRes.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+
+      proxyRes.on('end', () => {
+        let finalBody = responseBody;
+
+        // 尝试转换响应格式
+        try {
+          const jsonData = JSON.parse(responseBody);
+          
+          if (jsonData.data && jsonData.data.choices) {
+            console.log(`[FORMAT] 转换为 OpenAI 格式`);
+            finalBody = JSON.stringify(jsonData.data);
+          }
+        } catch (e) {
+          // 保持原样
+        }
+
+        const responseHeaders = {
+          ...corsHeaders,
+          'Content-Type': 'application/json; charset=utf-8',
+        };
+
+        res.writeHead(proxyRes.statusCode || 200, responseHeaders);
+        res.end(finalBody);
+      });
     }
   );
 
   proxyReq.on('error', (error) => {
-    if (isResSent) return;
-    isResSent = true;
+    console.error(`[ERROR] 代理请求失败:`, error.code, error.message);
     res.writeHead(502, corsHeaders);
-    res.end(JSON.stringify({ error: '上游请求失败', message: error.message }));
+    res.end(JSON.stringify({
+      error: '上游请求失败',
+      message: error.message,
+    }));
   });
 
   proxyReq.on('timeout', () => {
-    if (isResSent) return;
-    isResSent = true;
+    console.error(`[ERROR] 代理请求超时`);
     proxyReq.destroy();
     res.writeHead(504, corsHeaders);
-    res.end(JSON.stringify({ error: '网关超时 (600s)' }));
+    res.end(JSON.stringify({
+      error: '网关超时',
+      message: '上游服务器响应超时',
+    }));
   });
 
-  // 把客户端发出的请求原样转发
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    req.pipe(proxyReq);
+  // 转发请求体
+  if (req.method !== 'GET') {
+    req.on('data', (chunk) => {
+      proxyReq.write(chunk);
+    });
+    req.on('end', () => {
+      proxyReq.end();
+    });
   } else {
     proxyReq.end();
   }
 }
 
+// 启动服务器
 const server = http.createServer(proxyRequest);
-server.listen(PORT, () => console.log(`🚀 中转服务已成功启动并绑定上游 https://ollama.com/v1，监听端口 ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ 中转服务器运行在端口 ${PORT}`);
+  console.log(`📡 上游服务: ${DEFAULT_UPSTREAM_BASE_URL}`);
+});
