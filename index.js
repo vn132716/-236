@@ -2,6 +2,7 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
+// 固化你的上游平台地址
 const UPSTREAM_BASE_URL = 'https://ollama.com/v1';
 const PORT = process.env.PORT || 3000;
 
@@ -28,16 +29,17 @@ function proxyRequest(req, res) {
   
   if (pathAndQuery === '/' || pathAndQuery === '') {
       res.writeHead(200, corsHeaders);
-      res.end("Railway 中转代理运行正常！（流式透传模式）");
+      res.end("Railway 中转代理运行正常！（对接 ollama.com/v1 纯净透传模式）");
       return;
   }
 
-  // 拼接上游地址
+  // 智能拼接上游地址：兼容根路径请求与完整的 /v1 路径
   let upstreamPathFull = UPSTREAM_BASE_URL;
   if (pathAndQuery.startsWith('/v1')) {
     upstreamPathFull = 'https://ollama.com' + pathAndQuery;
   } else {
-    upstreamPathFull = UPSTREAM_BASE_URL + pathAndQuery;
+    // 如果请求不带 /v1，自动拼在 baseurl 后面
+    upstreamPathFull = UPSTREAM_BASE_URL + pathAndQuery.replace(/^\//, '');
   }
 
   const upstreamHeaders = { ...req.headers };
@@ -55,6 +57,9 @@ function proxyRequest(req, res) {
   const protocol = upstreamUrlObj.protocol === 'https:' ? https : http;
   const port = upstreamUrlObj.port || (upstreamUrlObj.protocol === 'https:' ? 443 : 80);
 
+  // 防重复响应锁，避免 ERR_HTTP_HEADERS_SENT 崩溃
+  let isResSent = false;
+
   const proxyReq = protocol.request(
     {
       hostname: upstreamUrlObj.hostname,
@@ -62,31 +67,36 @@ function proxyRequest(req, res) {
       path: upstreamUrlObj.pathname + upstreamUrlObj.search,
       method: req.method,
       headers: upstreamHeaders,
-      timeout: 600000, // 核心需求：保持 600 秒不断开
+      timeout: 600000, // 保持 600 秒长连接
     },
     (proxyRes) => {
-      // 组装返回的响应头
+      if (isResSent) return;
+      isResSent = true;
+
+      // 无损透传响应头和二进制/文本流，绝对不随意篡改返回体
       const responseHeaders = { ...proxyRes.headers, ...corsHeaders };
       res.writeHead(proxyRes.statusCode || 200, responseHeaders);
       
-      // 这一次不用任何自作聪明的数据拦截清洗
-      // 直接使用管道(pipe)，实现真正的打字机流式输出，彻底保证 NAI 模板的 `//` 格式不被破坏
       proxyRes.pipe(res);
     }
   );
 
   proxyReq.on('error', (error) => {
+    if (isResSent) return;
+    isResSent = true;
     res.writeHead(502, corsHeaders);
     res.end(JSON.stringify({ error: '上游请求失败', message: error.message }));
   });
 
   proxyReq.on('timeout', () => {
+    if (isResSent) return;
+    isResSent = true;
     proxyReq.destroy();
     res.writeHead(504, corsHeaders);
     res.end(JSON.stringify({ error: '网关超时 (600s)' }));
   });
 
-  // 把你的发出的请求也原样实时转发过去
+  // 把客户端发出的请求原样转发
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     req.pipe(proxyReq);
   } else {
@@ -95,4 +105,4 @@ function proxyRequest(req, res) {
 }
 
 const server = http.createServer(proxyRequest);
-server.listen(PORT, () => console.log(`✅ 中转服务已启动并运行在端口 ${PORT}，流式纯净透传模式已开启`));
+server.listen(PORT, () => console.log(`🚀 中转服务已成功启动并绑定上游 https://ollama.com/v1，监听端口 ${PORT}`));
