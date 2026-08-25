@@ -2,93 +2,68 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
-const DEFAULT_UPSTREAM_BASE_URL = '[https://ollama.com/v1](https://ollama.com/v1)';
+// 固定的上游地址
+const UPSTREAM_BASE_URL = 'https://ollama.com/v1';
 const PORT = process.env.PORT || 3000;
-
-const ROUTES = new Map([
-  ['/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
-  ['/models', { method: 'GET', upstreamPath: 'models' }],
-]);
 
 function getCorsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
-    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
+    'Access-Control-Allow-Headers': '*',
   };
-}
-
-function normalizePath(pathname) {
-  if (pathname === '/') return pathname;
-  return pathname.replace(/\/+$/, '');
 }
 
 // 专门用于清洗模型返回的非法 JSON / Markdown / 带有 // 注释的字符串
 function cleanContentString(content) {
   if (typeof content !== 'string') return content;
-
   let cleaned = content;
-
-  // 1. 去除 Markdown 代码块包裹 ```json 和 ```
+  
+  // 1. 去除 Markdown 代码块包裹
   cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-
-  // 2. 尝试提取真正的 JSON 主体 {...}
+  
+  // 2. 提取真正的 JSON 主体 {...}
   const firstBrace = cleaned.indexOf('{');
   const lastBrace = cleaned.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     cleaned = cleaned.substring(firstBrace, lastBrace + 1);
   }
-
+  
   // 3. 移除 JSON 内部出现的单行注释 (例如 // Role 1)
   cleaned = cleaned.replace(/\/\/[^\n"]*(?=\n|")/g, '');
-
+  
   return cleaned.trim();
 }
 
 function proxyRequest(req, res) {
   const corsHeaders = getCorsHeaders();
-  const pathname = normalizePath(new URL(req.url, `http://${req.headers.host}`).pathname);
-
-  console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
-
-  if (pathname === '/health') {
-    res.writeHead(200, corsHeaders);
-    res.end(JSON.stringify({ ok: true, upstream: 'ollama-api-v1' }));
-    return;
-  }
-
+  
   if (req.method === 'OPTIONS') {
     res.writeHead(204, corsHeaders);
     res.end();
     return;
   }
 
-  const route = ROUTES.get(pathname);
-  if (!route) {
-    res.writeHead(404, corsHeaders);
-    res.end(JSON.stringify({ error: '未知路径' }));
-    return;
-  }
-
-  if (req.method !== route.method) {
-    res.writeHead(405, corsHeaders);
-    res.end(JSON.stringify({ error: '方法不允许' }));
-    return;
-  }
-
-  const upstreamPathFull = `${DEFAULT_UPSTREAM_BASE_URL}/${route.upstreamPath}`;
-  const upstreamHeaders = {};
+  let requestUrlObj = new URL(req.url, `http://${req.headers.host}`);
+  let pathAndQuery = requestUrlObj.pathname + requestUrlObj.search;
   
-  if (req.headers['content-type']) {
-    upstreamHeaders['Content-Type'] = req.headers['content-type'];
-  } else if (req.method !== 'GET') {
-    upstreamHeaders['Content-Type'] = 'application/json';
+  if (pathAndQuery === '/' || pathAndQuery === '') {
+      res.writeHead(200, corsHeaders);
+      res.end("Railway 中转代理运行正常！");
+      return;
   }
 
-  if (req.headers.authorization) {
-    upstreamHeaders['Authorization'] = req.headers.authorization;
+  // 智能拼接上游路径，完美支持 /chat/completions 和 /models
+  let upstreamPathFull = UPSTREAM_BASE_URL;
+  if (pathAndQuery.startsWith('/v1')) {
+    upstreamPathFull = 'https://ollama.com' + pathAndQuery;
+  } else {
+    upstreamPathFull = UPSTREAM_BASE_URL + pathAndQuery;
   }
+
+  const upstreamHeaders = { ...req.headers };
+  delete upstreamHeaders.host;
+  delete upstreamHeaders['accept-encoding']; // 禁用压缩，防止清洗乱码
 
   let upstreamUrlObj;
   try {
@@ -109,46 +84,48 @@ function proxyRequest(req, res) {
       path: upstreamUrlObj.pathname + upstreamUrlObj.search,
       method: req.method,
       headers: upstreamHeaders,
-      timeout: 600000,
+      timeout: 600000, // 600秒超时
     },
     (proxyRes) => {
-      let responseBody = '';
+      let responseBody = [];
 
-      proxyRes.on('data', (chunk) => {
-        responseBody += chunk;
+      proxyRes.on('data', (chunk) => { 
+        responseBody.push(chunk); 
       });
 
       proxyRes.on('end', () => {
-        let finalBody = responseBody;
+        let bodyBuffer = Buffer.concat(responseBody);
+        let finalBody = bodyBuffer;
+        
+        // 当返回 JSON 时，自动过滤数据里的污染字符
+        const contentType = proxyRes.headers['content-type'] || '';
+        if (contentType.includes('application/json')) {
+          try {
+            let textBody = bodyBuffer.toString('utf-8');
+            let jsonData = JSON.parse(textBody);
+            
+            // 兼容解包 data 结构
+            if (jsonData.data && jsonData.data.choices) {
+              jsonData = jsonData.data;
+            }
 
-        try {
-          const jsonData = JSON.parse(responseBody);
-
-          // 自动清洗 choices 内返回的 content 字符串
-          if (jsonData.choices && Array.isArray(jsonData.choices)) {
-            jsonData.choices.forEach((choice) => {
-              if (choice.message && choice.message.content) {
-                choice.message.content = cleanContentString(choice.message.content);
-              }
-            });
-            finalBody = JSON.stringify(jsonData);
-          } else if (jsonData.data && jsonData.data.choices) {
-            jsonData.data.choices.forEach((choice) => {
-              if (choice.message && choice.message.content) {
-                choice.message.content = cleanContentString(choice.message.content);
-              }
-            });
-            finalBody = JSON.stringify(jsonData.data);
+            // 深度清洗 content 里的注释和 markdown
+            if (jsonData.choices && Array.isArray(jsonData.choices)) {
+              jsonData.choices.forEach((choice) => {
+                if (choice.message && choice.message.content) {
+                  choice.message.content = cleanContentString(choice.message.content);
+                }
+              });
+              finalBody = JSON.stringify(jsonData);
+            }
+          } catch (e) {
+            // 如果解析失败则保持原样透传
           }
-        } catch (e) {
-          console.error('[CLEAN ERROR] JSON 过滤解析失败:', e.message);
         }
 
-        const responseHeaders = {
-          ...corsHeaders,
-          'Content-Type': 'application/json; charset=utf-8',
-        };
-
+        const responseHeaders = { ...proxyRes.headers, ...corsHeaders };
+        delete responseHeaders['content-length'];
+        
         res.writeHead(proxyRes.statusCode || 200, responseHeaders);
         res.end(finalBody);
       });
@@ -163,10 +140,10 @@ function proxyRequest(req, res) {
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
     res.writeHead(504, corsHeaders);
-    res.end(JSON.stringify({ error: '网关超时', message: '上游服务器响应超时' }));
+    res.end(JSON.stringify({ error: '网关超时' }));
   });
 
-  if (req.method !== 'GET') {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
     req.on('data', (chunk) => proxyReq.write(chunk));
     req.on('end', () => proxyReq.end());
   } else {
@@ -175,6 +152,4 @@ function proxyRequest(req, res) {
 }
 
 const server = http.createServer(proxyRequest);
-server.listen(PORT, () => {
-  console.log(`✅ 清洗服务运行在端口 ${PORT}`);
-});
+server.listen(PORT, () => console.log(`✅ 中转服务已锁定 https://ollama.com/v1 并运行在端口 ${PORT}`));
