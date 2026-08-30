@@ -2,8 +2,8 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
-// 目标上游网址
-const DEFAULT_UPSTREAM_BASE_URL = 'https://api.cline.bot/api/v1';
+// 修正为 Ollama 官方 API 上游地址
+const DEFAULT_UPSTREAM_BASE_URL = 'https://ollama.com/v1';
 const PORT = process.env.PORT || 3000;
 
 // 兼容酒馆带 /v1 和不带 /v1 的请求
@@ -35,9 +35,9 @@ function proxyRequest(req, res) {
   console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
 
   // 健康检查
-  if (pathname === '/health') {
+  if (pathname === '/health' || pathname === '/') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, upstream: 'cline-api-v1' }));
+    res.end(JSON.stringify({ ok: true, upstream: DEFAULT_UPSTREAM_BASE_URL }));
     return;
   }
 
@@ -53,7 +53,7 @@ function proxyRequest(req, res) {
   if (!route) {
     console.log(`[ERROR] 路由未找到: ${pathname}`);
     res.writeHead(404, { ...corsHeaders, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: '未知路径' }));
+    res.end(JSON.stringify({ error: '未知路径', path: pathname }));
     return;
   }
 
@@ -99,18 +99,17 @@ function proxyRequest(req, res) {
       path: upstreamUrlObj.pathname + upstreamUrlObj.search,
       method: req.method,
       headers: upstreamHeaders,
-      timeout: 200000, // 200 秒
+      timeout: 200000, // 200 秒超时
     },
     (proxyRes) => {
       console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
       
-      // 盲透传：把上游返回的 header 全部传给插件，不再去乱改数据
+      // 纯净盲透传：把响应和数据流原封不动交给酒馆/生图插件
       res.writeHead(proxyRes.statusCode || 200, {
         ...corsHeaders,
         ...proxyRes.headers
       });
 
-      // 数据流直接对接，避免 JSON 解析崩溃
       proxyRes.pipe(res, { end: true });
     }
   );
@@ -132,7 +131,7 @@ function proxyRequest(req, res) {
     }
   });
 
-  // 接收酒馆插件发来的数据并转发
+  // 接收请求体并转发
   if (req.method !== 'GET') {
     req.pipe(proxyReq, { end: true });
   } else {
