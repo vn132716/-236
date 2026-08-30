@@ -45,95 +45,95 @@ function proxyRequest(req, res) {
   }
 
   // 检查路由
-  const route = ROUTES.get(pathname);
-  if (!route) {
-    console.log(`[ERROR] 路由未找到: ${pathname}`);
-    res.writeHead(404, corsHeaders);
-    res.end(JSON.stringify({ error: '未知路径' }));
-    return;
+  Const路线=路由.得到(路径名);
+  如果 (!路线) {
+    控制台.日志('[ERROR]路由未找到：${路径名}‘)；
+res.WriteHead(404, corsHeaders);
+    res.结束(JSON.使字符串化({ 误差: '未知路径' }));
+    返回;
   }
 
-  if (req.method !== route.method) {
-    console.log(`[ERROR] 方法不允许: ${req.method}, 期望: ${route.method}`);
-    res.writeHead(405, corsHeaders);
-    res.end(JSON.stringify({ error: '方法不允许' }));
-    return;
+  如果 (req.方法!==路线.方法) {
+    控制台.日志('[error]方法不允许：${req.方法}，期望：${路线.方法}‘)；
+res.WriteHead(405, corsHeaders);
+    res.结束(JSON.使字符串化({ 误差: '方法不允许' }));
+    返回;
   }
 
-  // 构建上游 URL
-  const upstreamPathFull = `${DEFAULT_UPSTREAM_BASE_URL}/${route.upstreamPath}`;
-  console.log(`[UPSTREAM] ${req.method} ${upstreamPathFull}`);
+  //构建上游URL
+  ConstupstreamPathFull=`${default_UPSTREAM_BASE_URL}/${路线.上游路径}`;
+  控制台.日志('[上游]${req.方法}${upstreamPathFull}')；
 
   // 构建上游请求头
-  const upstreamHeaders = {};
+  ConstupstreamHeaders={};
   
-  if (req.headers['content-type']) {
-    upstreamHeaders['Content-Type'] = req.headers['content-type'];
-  } else if (req.method !== 'GET') {
-    upstreamHeaders['Content-Type'] = 'application/json';
+  如果 (req.页眉['内容类型']) {
+    upstreamHeaders['内容类型']=req.页眉['内容类型'];
+  } 其他 如果 (req.方法!=='GET') {
+    upstreamHeaders['内容类型']='应用程序/约翰逊;
   }
 
-  if (req.headers.authorization) {
-    upstreamHeaders['Authorization'] = req.headers.authorization;
+  如果 (req.页眉.授权) {
+    upstreamHeaders['授权']=req.页眉.授权;
   }
 
-  // 解析 URL
-  let upstreamUrlObj;
-  try {
-    upstreamUrlObj = new URL(upstreamPathFull);
-  } catch (e) {
-    console.error(`[ERROR] URL 解析失败: ${upstreamPathFull}`, e.message);
-    res.writeHead(400, corsHeaders);
-    res.end(JSON.stringify({ error: 'URL 格式错误', details: e.message }));
-    return;
+  //解析url
+  让upstreamUrlObj;
+  尝试 {
+    upstreamUrlObj=新的 URL(upstreamPathFull);
+  } 赶上 (e) {
+    控制台.误差('[ERROR]URL解析失败：${upstreamPathFull}'，e.消息)；
+res.WriteHead(400, corsHeaders);
+    res.结束(JSON.使字符串化({ 误差: 'URL格式错误', 详细资料: e.消息 }));
+    返回;
   }
 
-  const protocol = upstreamUrlObj.protocol === 'https:' ? https : http;
-  const port = upstreamUrlObj.port || (upstreamUrlObj.protocol === 'https:' ? 443 : 80);
+  Const协议=upstreamUrlObj.协议==='https：' ? HTTPS : HTTP;
+  Const港口=upstreamUrlObj.港口||(upstreamUrlObj.协议==='https：' ? 443 : 80);
 
-  console.log(`[REQUEST] ${upstreamUrlObj.hostname}:${port}${upstreamUrlObj.pathname}`);
+  控制台.日志('[REQUEST]${upstreamUrlObj。主机名}：${港口}${upstreamUrlObj.路径名}‘)；
 
   // 转发请求
-  const proxyReq = protocol.request(
+  ConstproxyReq=协议.请求(
     {
-      hostname: upstreamUrlObj.hostname,
-      port: port,
-      path: upstreamUrlObj.pathname + upstreamUrlObj.search,
-      method: req.method,
-      headers: upstreamHeaders,
-      timeout: 600000, // 600 秒
+      主机名: upstreamUrlObj.主机名,
+      港口: 港口,
+      路径: upstreamUrlObj.路径名+upstreamUrlObj.搜索,
+      方法: req.方法,
+      页眉: upstreamHeaders,
+      超时: 200000, //200秒
     },
-    (proxyRes) => {
-      console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
+    (proxyRes)=>{
+      控制台.日志('[response]状态：${proxyRes.statusCode}')；
       
-      let responseBody = '';
+      让ResponseBody='';
 
-      proxyRes.on('data', (chunk) => {
-        responseBody += chunk;
+      proxyRes.在……之上('数据', (大块)=>{
+        ResponseBody+=大块;
       });
 
-      proxyRes.on('end', () => {
-        let finalBody = responseBody;
+      proxyRes.在……之上('结束', ()=>{
+        让finalBody=ResponseBody;
 
         // 尝试转换响应格式
-        try {
-          const jsonData = JSON.parse(responseBody);
+        尝试 {
+          ConstjsonData=JSON.解析(ResponseBody);
           
-          if (jsonData.data && jsonData.data.choices) {
-            console.log(`[FORMAT] 转换为 OpenAI 格式`);
-            finalBody = JSON.stringify(jsonData.data);
+          如果 (jsonData.数据 && jsonData.数据.选择) {
+            控制台.日志('[FORMAT]转换为OpenAI格式‘)；
+            finalBody=JSON.使字符串化(jsonData.数据);
           }
-        } catch (e) {
+        } 赶上 (e) {
           // 保持原样
         }
 
-        const responseHeaders = {
+        ConstresponseHeaders={
           ...corsHeaders,
-          'Content-Type': 'application/json; charset=utf-8',
+          '内容类型': 'application/json；charset=utf-8',
         };
 
-        res.writeHead(proxyRes.statusCode || 200, responseHeaders);
-        res.end(finalBody);
+        res.WriteHead(proxyRes.statusCode||200, responseHeaders);
+        res.结束(finalBody);
       });
     }
   );
