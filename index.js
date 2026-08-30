@@ -2,11 +2,15 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
-const DEFAULT_UPSTREAM_BASE_URL = 'https://ollama.com/v1';
+// 目标上游网址
+const DEFAULT_UPSTREAM_BASE_URL = 'https://api.cline.bot/api/v1';
 const PORT = process.env.PORT || 3000;
 
+// 兼容酒馆带 /v1 和不带 /v1 的请求
 const ROUTES = new Map([
+  ['/v1/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
   ['/chat/completions', { method: 'POST', upstreamPath: 'chat/completions' }],
+  ['/v1/models', { method: 'GET', upstreamPath: 'models' }],
   ['/models', { method: 'GET', upstreamPath: 'models' }],
 ]);
 
@@ -15,7 +19,6 @@ function getCorsHeaders() {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept',
-    'Content-Type': 'application/json; charset=utf-8',
   };
 }
 
@@ -26,14 +29,15 @@ function normalizePath(pathname) {
 
 function proxyRequest(req, res) {
   const corsHeaders = getCorsHeaders();
-  const pathname = normalizePath(new URL(req.url, `http://${req.headers.host}`).pathname);
+  const hostHeader = req.headers.host || 'localhost';
+  const pathname = normalizePath(new URL(req.url, `http://${hostHeader}`).pathname);
 
   console.log(`[${new Date().toISOString()}] ${req.method} ${pathname}`);
 
   // 健康检查
   if (pathname === '/health') {
-    res.writeHead(200, corsHeaders);
-    res.end(JSON.stringify({ ok: true, upstream: 'ollama-api-v1' }));
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, upstream: 'cline-api-v1' }));
     return;
   }
 
@@ -45,126 +49,92 @@ function proxyRequest(req, res) {
   }
 
   // 检查路由
-  Const路线=路由.得到(路径名);
-  如果 (!路线) {
-    控制台.日志('[ERROR]路由未找到：${路径名}‘)；
-res.WriteHead(404, corsHeaders);
-    res.结束(JSON.使字符串化({ 误差: '未知路径' }));
-    返回;
+  const route = ROUTES.get(pathname);
+  if (!route) {
+    console.log(`[ERROR] 路由未找到: ${pathname}`);
+    res.writeHead(404, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: '未知路径' }));
+    return;
   }
 
-  如果 (req.方法!==路线.方法) {
-    控制台.日志('[error]方法不允许：${req.方法}，期望：${路线.方法}‘)；
-res.WriteHead(405, corsHeaders);
-    res.结束(JSON.使字符串化({ 误差: '方法不允许' }));
-    返回;
+  if (req.method !== route.method) {
+    console.log(`[ERROR] 方法不允许: ${req.method}, 期望: ${route.method}`);
+    res.writeHead(405, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: '方法不允许' }));
+    return;
   }
 
-  //构建上游URL
-  ConstupstreamPathFull=`${default_UPSTREAM_BASE_URL}/${路线.上游路径}`;
-  控制台.日志('[上游]${req.方法}${upstreamPathFull}')；
-
-  // 构建上游请求头
-  ConstupstreamHeaders={};
+  // 构建上游 URL
+  const upstreamPathFull = `${DEFAULT_UPSTREAM_BASE_URL}/${route.upstreamPath}`;
   
-  如果 (req.页眉['内容类型']) {
-    upstreamHeaders['内容类型']=req.页眉['内容类型'];
-  } 其他 如果 (req.方法!=='GET') {
-    upstreamHeaders['内容类型']='应用程序/约翰逊;
+  // 构建上游请求头
+  const upstreamHeaders = {};
+  if (req.headers['content-type']) {
+    upstreamHeaders['Content-Type'] = req.headers['content-type'];
+  } else if (req.method !== 'GET') {
+    upstreamHeaders['Content-Type'] = 'application/json';
+  }
+  if (req.headers.authorization) {
+    upstreamHeaders['Authorization'] = req.headers.authorization;
   }
 
-  如果 (req.页眉.授权) {
-    upstreamHeaders['授权']=req.页眉.授权;
+  // 解析 URL
+  let upstreamUrlObj;
+  try {
+    upstreamUrlObj = new URL(upstreamPathFull);
+  } catch (e) {
+    res.writeHead(400, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'URL 格式错误', details: e.message }));
+    return;
   }
 
-  //解析url
-  让upstreamUrlObj;
-  尝试 {
-    upstreamUrlObj=新的 URL(upstreamPathFull);
-  } 赶上 (e) {
-    控制台.误差('[ERROR]URL解析失败：${upstreamPathFull}'，e.消息)；
-res.WriteHead(400, corsHeaders);
-    res.结束(JSON.使字符串化({ 误差: 'URL格式错误', 详细资料: e.消息 }));
-    返回;
-  }
-
-  Const协议=upstreamUrlObj.协议==='https：' ? HTTPS : HTTP;
-  Const港口=upstreamUrlObj.港口||(upstreamUrlObj.协议==='https：' ? 443 : 80);
-
-  控制台.日志('[REQUEST]${upstreamUrlObj。主机名}：${港口}${upstreamUrlObj.路径名}‘)；
+  const protocol = upstreamUrlObj.protocol === 'https:' ? https : http;
+  const port = upstreamUrlObj.port || (upstreamUrlObj.protocol === 'https:' ? 443 : 80);
 
   // 转发请求
-  ConstproxyReq=协议.请求(
+  const proxyReq = protocol.request(
     {
-      主机名: upstreamUrlObj.主机名,
-      港口: 港口,
-      路径: upstreamUrlObj.路径名+upstreamUrlObj.搜索,
-      方法: req.方法,
-      页眉: upstreamHeaders,
-      超时: 200000, //200秒
+      hostname: upstreamUrlObj.hostname,
+      port: port,
+      path: upstreamUrlObj.pathname + upstreamUrlObj.search,
+      method: req.method,
+      headers: upstreamHeaders,
+      timeout: 200000, // 200 秒
     },
-    (proxyRes)=>{
-      控制台.日志('[response]状态：${proxyRes.statusCode}')；
+    (proxyRes) => {
+      console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
       
-      让ResponseBody='';
-
-      proxyRes.在……之上('数据', (大块)=>{
-        ResponseBody+=大块;
+      // 盲透传：把上游返回的 header 全部传给插件，不再去乱改数据
+      res.writeHead(proxyRes.statusCode || 200, {
+        ...corsHeaders,
+        ...proxyRes.headers
       });
 
-      proxyRes.在……之上('结束', ()=>{
-        让finalBody=ResponseBody;
-
-        // 尝试转换响应格式
-        尝试 {
-          ConstjsonData=JSON.解析(ResponseBody);
-          
-          如果 (jsonData.数据 && jsonData.数据.选择) {
-            控制台.日志('[FORMAT]转换为OpenAI格式‘)；
-            finalBody=JSON.使字符串化(jsonData.数据);
-          }
-        } 赶上 (e) {
-          // 保持原样
-        }
-
-        ConstresponseHeaders={
-          ...corsHeaders,
-          '内容类型': 'application/json；charset=utf-8',
-        };
-
-        res.WriteHead(proxyRes.statusCode||200, responseHeaders);
-        res.结束(finalBody);
-      });
+      // 数据流直接对接，避免 JSON 解析崩溃
+      proxyRes.pipe(res, { end: true });
     }
   );
 
   proxyReq.on('error', (error) => {
-    console.error(`[ERROR] 代理请求失败:`, error.code, error.message);
-    res.writeHead(502, corsHeaders);
-    res.end(JSON.stringify({
-      error: '上游请求失败',
-      message: error.message,
-    }));
+    console.error(`[ERROR] 代理请求失败:`, error.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: '上游请求失败', message: error.message }));
+    }
   });
 
   proxyReq.on('timeout', () => {
     console.error(`[ERROR] 代理请求超时`);
     proxyReq.destroy();
-    res.writeHead(504, corsHeaders);
-    res.end(JSON.stringify({
-      error: '网关超时',
-      message: '上游服务器响应超时',
-    }));
+    if (!res.headersSent) {
+      res.writeHead(504, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: '网关超时', message: '响应超过 200 秒' }));
+    }
   });
 
-  // 转发请求体
+  // 接收酒馆插件发来的数据并转发
   if (req.method !== 'GET') {
-    req.on('data', (chunk) => {
-      proxyReq.write(chunk);
-    });
-    req.on('end', () => {
-      proxyReq.end();
-    });
+    req.pipe(proxyReq, { end: true });
   } else {
     proxyReq.end();
   }
@@ -172,7 +142,7 @@ res.WriteHead(400, corsHeaders);
 
 // 启动服务器
 const server = http.createServer(proxyRequest);
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ 中转服务器运行在端口 ${PORT}`);
   console.log(`📡 上游服务: ${DEFAULT_UPSTREAM_BASE_URL}`);
 });
