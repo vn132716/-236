@@ -99,7 +99,7 @@ function proxyRequest(req, res) {
       path: upstreamUrlObj.pathname + upstreamUrlObj.search,
       method: req.method,
       headers: upstreamHeaders,
-      timeout: 200000, // 200 秒超时
+      timeout: 300000, // 300 秒超时
     },
     (proxyRes) => {
       console.log(`[RESPONSE] Status: ${proxyRes.statusCode}`);
@@ -127,7 +127,7 @@ function proxyRequest(req, res) {
     proxyReq.destroy();
     if (!res.headersSent) {
       res.writeHead(504, { ...corsHeaders, 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: '网关超时', message: '响应超过 200 秒' }));
+      res.end(JSON.stringify({ error: '网关超时', message: '响应超过 300 秒' }));
     }
   });
 
